@@ -1,4 +1,4 @@
-# expose-controller ( not deployment ready)
+# expose-controller 
 expose controller, when deployment created service and ingress will be created
 
 How to test
@@ -26,3 +26,5 @@ How to test
 #Improvements
 1. service and ingress name, ports etc
 2. handling ingress & service when manually deleted.
+
+Note: Code is not deployment ready, can be used for learning purposes.
