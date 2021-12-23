@@ -34,6 +34,8 @@ func main() {
 	ctrl := controller.New(
 		clientset,
 		informers.Apps().V1().Deployments(),
+		informers.Networking().V1().Ingresses(),
+		informers.Core().V1().Services(),
 		5,
 	)
 

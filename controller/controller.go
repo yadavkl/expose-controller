@@ -13,24 +13,36 @@ import (
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	netinformers "k8s.io/client-go/informers/networking/v1"
 	"k8s.io/client-go/kubernetes"
 	appslisters "k8s.io/client-go/listers/apps/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	netlisters "k8s.io/client-go/listers/networking/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 )
 
 type controller struct {
 	clientset  kubernetes.Interface
-	lister     appslisters.DeploymentLister
+	depLister  appslisters.DeploymentLister
+	ingLister  netlisters.IngressLister
+	svcLister  corelisters.ServiceLister
 	cacheSyncd cache.InformerSynced
 	queue      workqueue.RateLimitingInterface
 	workers    int
 }
 
-func New(clientset kubernetes.Interface, depInformer appsinformers.DeploymentInformer, workers int) *controller {
+func New(clientset kubernetes.Interface,
+	depInformer appsinformers.DeploymentInformer,
+	netInformer netinformers.IngressInformer,
+	svcInformer coreinformers.ServiceInformer,
+	workers int) *controller {
 	c := &controller{
 		clientset:  clientset,
-		lister:     depInformer.Lister(),
+		depLister:  depInformer.Lister(),
+		svcLister:  svcInformer.Lister(),
+		ingLister:  netInformer.Lister(),
 		cacheSyncd: depInformer.Informer().HasSynced,
 		queue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "expose"),
 		workers:    workers,
@@ -41,6 +53,17 @@ func New(clientset kubernetes.Interface, depInformer appsinformers.DeploymentInf
 			DeleteFunc: c.handleDelete,
 		},
 	)
+	netInformer.Informer().AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			DeleteFunc: c.handleDelete,
+		},
+	)
+	svcInformer.Informer().AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			DeleteFunc: c.handleDelete,
+		},
+	)
+
 	return c
 }
 
@@ -68,7 +91,7 @@ func (c *controller) Run(ch <-chan struct{}) {
 	fmt.Println("Starting the controller\n")
 
 	if !cache.WaitForCacheSync(ch, c.cacheSyncd) {
-		runtime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
+		runtime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
 		return
 	}
 	for i := 0; i <= c.workers; i++ {
@@ -90,20 +113,33 @@ func (c *controller) processNextItem() bool {
 		fmt.Printf("Spliting name & namespace Error: %s\n", err.Error())
 		return false
 	}
-
-	//Check if object deleted from cluster
-	dep, err := c.clientset.AppsV1().Deployments(ns).Get(context.Background(), name, metav1.GetOptions{})
+	//check if service deleted
+	_, err = c.clientset.CoreV1().Services(ns).Get(context.Background(), name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		fmt.Printf("Deployment %s event delete \n", dep.Name)
+		fmt.Printf("services %s event delete \n", name)
+		err = c.syncDeployment(ns, name)
+		return err == nil
+	}
+	//check if ingress deleted
+	_, err = c.clientset.NetworkingV1().Ingresses(ns).Get(context.Background(), name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		fmt.Printf("Ingress %s event delete \n", name)
+		err = createIngress(context.Background(), c.clientset, ns, name)
+		return err == nil
+	}
+	//Check if object deleted from cluster
+	_, err = c.clientset.AppsV1().Deployments(ns).Get(context.Background(), name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		fmt.Printf("Deployment %s event delete \n", name)
 		err = c.clientset.CoreV1().Services(ns).Delete(context.Background(), name, metav1.DeleteOptions{})
 		if err != nil {
-			fmt.Printf("deleting service %s error: %s\n", dep.Name, err.Error())
+			fmt.Printf("deleting service %s error: %s\n", name, err.Error())
 			return false
 		}
 
 		err = c.clientset.NetworkingV1().Ingresses(ns).Delete(context.Background(), name, metav1.DeleteOptions{})
 		if err != nil {
-			fmt.Printf("deleting ingress %s error: %s\n", dep.Name, err.Error())
+			fmt.Printf("deleting ingress %s error: %s\n", name, err.Error())
 			return false
 		}
 		return true
@@ -127,7 +163,7 @@ func (c *controller) handleError(key interface{}) {
 }
 
 func (c *controller) syncDeployment(ns, name string) error {
-	dep, err := c.lister.Deployments(ns).Get(name)
+	dep, err := c.depLister.Deployments(ns).Get(name)
 	if err != nil {
 		fmt.Printf("Error getting Deployment: %s\n", err.Error())
 		return err
@@ -153,21 +189,21 @@ func (c *controller) syncDeployment(ns, name string) error {
 			},
 		},
 	}
-	s, err := c.clientset.CoreV1().Services(ns).Create(context.Background(), &svc, metav1.CreateOptions{})
+	_, err = c.clientset.CoreV1().Services(ns).Create(context.Background(), &svc, metav1.CreateOptions{})
 	if err != nil {
 		fmt.Printf("Service failed: %s\n", err.Error())
 		return err
 	}
-	return createIngress(context.Background(), c.clientset, s)
+	return createIngress(context.Background(), c.clientset, ns, name)
 }
 
-func createIngress(ctx context.Context, client kubernetes.Interface, svc *corev1.Service) error {
+func createIngress(ctx context.Context, client kubernetes.Interface, ns string, name string) error {
 	pathType := "Prefix"
 	className := "nginx"
 	ingress := netv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      svc.Name,
-			Namespace: svc.Namespace,
+			Name:      name,
+			Namespace: ns,
 			Annotations: map[string]string{
 				"nginx.ingress.kubernetes.io/rewrite-target": "/",
 			},
@@ -180,11 +216,11 @@ func createIngress(ctx context.Context, client kubernetes.Interface, svc *corev1
 						HTTP: &netv1.HTTPIngressRuleValue{
 							Paths: []netv1.HTTPIngressPath{
 								{
-									Path:     fmt.Sprintf("/%s", svc.Name),
+									Path:     fmt.Sprintf("/%s", name),
 									PathType: (*netv1.PathType)(&pathType),
 									Backend: netv1.IngressBackend{
 										Service: &netv1.IngressServiceBackend{
-											Name: svc.Name,
+											Name: name,
 											Port: netv1.ServiceBackendPort{
 												Number: 80,
 											},
@@ -199,7 +235,7 @@ func createIngress(ctx context.Context, client kubernetes.Interface, svc *corev1
 		},
 	}
 
-	_, err := client.NetworkingV1().Ingresses(svc.Namespace).Create(ctx, &ingress, metav1.CreateOptions{})
+	_, err := client.NetworkingV1().Ingresses(ns).Create(ctx, &ingress, metav1.CreateOptions{})
 	return err
 }
 func (c *controller) runWorker() {
