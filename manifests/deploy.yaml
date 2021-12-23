@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  creationTimestamp: null
+  labels:
+    app: expose
+  name: expose
+  namespace: expose
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: expose
+  strategy: {}
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: expose
+    spec:
+      containers:
+      - image: yadavkl/expose:1.0.3
+        name: expose
+        resources: {}
+      serviceAccountName: expose-sa
+status: {}
