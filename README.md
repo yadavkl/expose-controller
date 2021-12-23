@@ -1,4 +1,4 @@
-# expose-controller
+# expose-controller ( not deployment ready)
 expose controller, when deployment created service and ingress will be created
 
 How to test
